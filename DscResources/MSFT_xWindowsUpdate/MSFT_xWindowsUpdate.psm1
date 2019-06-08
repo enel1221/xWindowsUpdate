@@ -1,3 +1,5 @@
+#Version2
+
 Data LocalizedData
 {
     # culture="en-US"e
@@ -44,7 +46,8 @@ Data LocalizedData
 
 $CacheLocation = "$env:ProgramData\Microsoft\Windows\PowerShell\Configuration\BuiltinProvCache\MSFT_xWindowsUpdate"
 
-# Get-TargetResource function  
+# Get-TargetResource function
+#Updated for MSPs
 function Get-TargetResource
 {
     [CmdletBinding()]
@@ -65,16 +68,34 @@ function Get-TargetResource
 
     Write-Verbose $($LocalizedData.GettingHotfixMessage -f ${Id})
 
-    $hotfix = Get-HotFix -Id "KB$kbId"
-    
+    try{###New change for MSPs###
+        If($Path.EndsWith(".msp")){
+        $patches = foreach ($key in (gci -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products" | where {$_.Name -match "F01FEC"})){
+            $subkey = $key.PSChildName
+            gci -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$subkey\Patches" -ErrorAction SilentlyContinue |
+            Get-ItemProperty | Select-Object displayname,@{Name='KB';Expression={$_.moreinfourl.substring($_.moreinfourl.length - 11).ToUpper() -replace '[\W]'}} | where {$_.displayname -ne ""}
+        }
+        $patches = $patches.KB | Sort-Object
+            If($patches.Contains("KB$kbId")){#present
+                $hotfix = New-Object PsObject -Property @{HotFixId="KB$kbId"; Installed="True"}
+            }else{#absent
+                $hotfix = New-Object PsObject -Property @{HotFixId="KB$kbId"; Installed="False"}
+            }
+        }else{
+            #normal code
+            $hotfix = Get-HotFix -Id "KB$kbId" -ErrorAction Stop
+            $hotfix | Add-Member NoteProperty -Name "Installed" -Value "True"
+        }
+    }
+    catch{$hotfix = New-Object PsObject -Property @{HotFixId="KB$kbId"; Installed="False"}}
+
     $returnValue = @{
         Path = ''
         Id = $hotfix.HotFixId
         Log = ''
+        Ensure = $hotfix.Installed
     }
-
-    $returnValue    
-
+    $returnValue
 }
 
 $Debug = $true
@@ -95,7 +116,7 @@ Function New-InvalidArgumentException
         [string] $ParamName
     )
     Set-StrictMode -Version latest
-    
+
     $exception = new-object System.ArgumentException $Message,$ParamName
     $errorRecord = New-Object System.Management.Automation.ErrorRecord $exception,$ParamName,'InvalidArgument',$null
     throw $errorRecord
@@ -105,7 +126,7 @@ Function New-InvalidArgumentException
 function Set-TargetResource
 {
     # should be [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidGlobalVars", "DSCMachineStatus")], but it doesn't work
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidGlobalVars", "")]   
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute("PSAvoidGlobalVars", "")]
     [CmdletBinding()]
     Param
     (
@@ -137,15 +158,20 @@ function Set-TargetResource
     }
     $uri, $kbId = Test-StandardArguments -Path $Path -Id $Id
 
-    
-            
     if($Ensure -eq 'Present')
     {
-        $filePath = Test-WindowsUpdatePath -uri $uri -Credential $Credential 
+        $filePath = Test-WindowsUpdatePath -uri $uri -Credential $Credential
         Write-Verbose "$($LocalizedData.StartKeyWord) $($LocalizedData.ActionInstallUsingwsusa)"
-    
-        Start-Process -FilePath 'wusa.exe' -ArgumentList "`"$filepath`" /quiet /norestart /log:`"$Log`"" -Wait -NoNewWindow -ErrorAction SilentlyContinue
-        $errorOccured = Get-WinEvent -Path $Log -Oldest | Where-Object {$_.Id -eq 3}                         
+
+        ###New change for MSPs###
+        If($Path.EndsWith(".msp")){#MSP install code
+            msiexec /update "$filepath" /quiet | Wait-Process #need work with log output and checking for errors
+        }else{#non MSP code
+            Start-Process -FilePath 'wusa.exe' -ArgumentList "`"$filepath`" /quiet /norestart /log:`"$Log`"" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+
+        ###MSP Code###
+        #Start-Process -FilePath 'wusa.exe' -ArgumentList "`"$filepath`" /quiet /norestart /log:`"$Log`"" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+        $errorOccured = Get-WinEvent -Path $Log -Oldest | Where-Object {$_.Id -eq 3}
         if($errorOccured)
         {
             $errorMessage= $errorOccured.Message
@@ -153,16 +179,17 @@ function Set-TargetResource
         }
 
         Write-Verbose "$($LocalizedData.EndKeyWord) $($LocalizedData.ActionInstallUsingwsusa)"
+        }
     }
     else
     {
         $argumentList = "/uninstall /KB:$kbId /quiet /norestart /log:`"$Log`""
-        
+
         Write-Verbose "$($LocalizedData.StartKeyWord) $($LocalizedData.ActionUninstallUsingwsusa) Arguments: $ArgumentList"
-    
-        Start-Process -FilePath 'wusa.exe' -ArgumentList $argumentList  -Wait -NoNewWindow  -ErrorAction SilentlyContinue 
+
+        Start-Process -FilePath 'wusa.exe' -ArgumentList $argumentList  -Wait -NoNewWindow  -ErrorAction SilentlyContinue
         #Read the log and see if there was an error event
-        $errorOccured = Get-WinEvent -Path $Log -Oldest | Where-Object {$_.Id -eq 3}                         
+        $errorOccured = Get-WinEvent -Path $Log -Oldest | Where-Object {$_.Id -eq 3}
         if($errorOccured)
         {
             $errorMessage= $errorOccured.Message
@@ -171,15 +198,15 @@ function Set-TargetResource
 
         Write-Verbose "$($LocalizedData.EndKeyWord) $($LocalizedData.ActionUninstallUsingwsusa)"
 
-        
+
     }
-    
+
     if (Test-Path -Path 'variable:\LASTEXITCODE')
     {
         if ($LASTEXITCODE -eq 3010)
         {
             # reboot machine if exitcode indicates reboot.
-            $global:DSCMachineStatus = 1        
+            $global:DSCMachineStatus = 1
         }
     }
 }
@@ -212,11 +239,26 @@ function Test-TargetResource
     Set-StrictMode -Version latest
     Write-Verbose "$($LocalizedData.TestingEnsure -f ${Ensure})"
     $uri, $kbId = Test-StandardArguments -Path $Path -Id $Id
-    
+
     # This is not the correct way to test to see if an update is applicable to a machine
     # but, WUSA does not currently expose a way to ask.
-    $result = Get-HotFix -Id "KB$kbId" -ErrorAction SilentlyContinue
+    #$result = Get-HotFix -Id "KB$kbId" -ErrorAction SilentlyContinue
+    ###New change for MSPs###
+    If($Path.EndsWith(".msp")){
+        #msp code
+        $patches = foreach ($key in (gci -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products" | where {$_.Name -match "F01FEC"})){
+        $subkey = $key.PSChildName
+        gci -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\$subkey\Patches" -ErrorAction SilentlyContinue |
+        Get-ItemProperty | Select-Object displayname,@{Name='KB';Expression={$_.moreinfourl.substring($_.moreinfourl.length - 11).ToUpper() -replace '[\W]'}} | where {$_.displayname -ne ""}
+        }
+        $result = $patches | Where-Object {$_.KB -eq "KB$kbId"}
+    }else{
+        #normal code
+        $result = Get-HotFix -Id "KB$kbId" -ErrorAction SilentlyContinue
+    }
+    ###MSP code change###
     $returnValue=  [bool]$result
+
     if($Ensure -eq 'Present')
     {
 
@@ -239,7 +281,7 @@ Function Test-StandardArguments
         $Id
     )
     Set-StrictMode -Version latest
-    
+
     Trace-Message ($LocalizedData.TestStandardArgumentsPathWasPath -f $Path)
     $uri = $null
     try
@@ -250,20 +292,20 @@ Function Test-StandardArguments
     {
         New-InvalidArgumentException ($LocalizedData.InvalidPath -f $Path) 'Path'
     }
-    
+
     if(-not @('file', 'http', 'https') -contains $uri.Scheme)
     {
         Trace-Message ($Localized.TheUriSchemeWasUriScheme -f $uri.Scheme)
         New-InvalidArgumentException ($LocalizedData.InvalidPath -f $Path) 'Path'
     }
-    
+
     $pathExt = [System.IO.Path]::GetExtension($Path)
     Trace-Message ($LocalizedData.ThePathExtensionWasPathExt -f $pathExt)
     if(-not @('.msu') -contains $pathExt.ToLower())
     {
         New-InvalidArgumentException ($LocalizedData.InvalidBinaryType -f $Path) 'Path'
     }
-    
+
     if(-not $Id)
     {
         New-InvalidArgumentException ($LocalizedData.NeedsMoreInfo -f $Path) 'Id'
@@ -293,7 +335,7 @@ Function Test-StandardArguments
             }
         }
     }
-    
+
     return @($uri, $kbId)
 }
 
@@ -307,7 +349,7 @@ function Test-WindowsUpdatePath
     param(
             [parameter(Mandatory = $true)]
             [System.Uri] $uri,
-            
+
             [pscredential] $Credential
     )
     Set-StrictMode -Version latest
@@ -321,7 +363,7 @@ function Test-WindowsUpdatePath
             #we pass a null for Credential which causes the cmdlet to pop a dialog up
             $psdriveArgs['Credential'] = $Credential
         }
-        
+
         $psdrive = New-PSDrive @psdriveArgs
         $Path = Join-Path $psdrive.Root (Split-Path -Leaf $uri.LocalPath) #Necessary?
     }
@@ -330,20 +372,20 @@ function Test-WindowsUpdatePath
         $scheme = $uri.Scheme
         $outStream = $null
         $responseStream = $null
-        
+
         try
         {
             Trace-Message ($LocalizedData.CreatingCacheLocation)
-            
+
             if(-not (Test-Path -PathType Container $CacheLocation))
             {
                 mkdir $CacheLocation | Out-Null
             }
-            
+
             $destName = Join-Path $CacheLocation (Split-Path -Leaf $uri.LocalPath)
-            
+
             Trace-Message ($LocalizedData.NeedToDownloadFileFromSchemeDestinationWillBeDestName -f $scheme, $destName)
-            
+
             try
             {
                 Trace-Message ($LocalizedData.CreatingTheDestinationCacheFile)
@@ -354,7 +396,7 @@ function Test-WindowsUpdatePath
                 #Should never happen since we own the cache directory
                 Throw-TerminatingError ($LocalizedData.CouldNotOpenDestFile -f $destName) $_
             }
-            
+
             try
             {
                 Trace-Message ($LocalizedData.CreatingTheSchemeStream -f $scheme)
@@ -365,7 +407,7 @@ function Test-WindowsUpdatePath
                 {
                     Trace-Message ($LocalizedData.SettingAuthenticationLevel)
                     # default value is MutualAuthRequested, which applies to https scheme
-                    $request.AuthenticationLevel = [System.Net.Security.AuthenticationLevel]::None                            
+                    $request.AuthenticationLevel = [System.Net.Security.AuthenticationLevel]::None
                 }
                 if ($scheme -eq 'https')
                 {
@@ -380,7 +422,7 @@ function Test-WindowsUpdatePath
                 Trace-Message ($LocalizedData.ErrorOutString -f ($_ | Out-String))
                 Throw-TerminatingError ($LocalizedData.CouldNotGetHttpStream -f $scheme, $Path) $_
             }
-            
+
             try
             {
                 Trace-Message ($LocalizedData.CopyingTheSchemeStreamBytesToTheDiskCache -f $scheme)
@@ -400,7 +442,7 @@ function Test-WindowsUpdatePath
             {
                 $outStream.Close()
             }
-            
+
             if($responseStream)
             {
                 $responseStream.Close()
@@ -413,6 +455,3 @@ function Test-WindowsUpdatePath
 }
 
 Export-ModuleMember -Function *-TargetResource
-
-
-
